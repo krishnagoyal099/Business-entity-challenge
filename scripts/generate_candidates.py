@@ -33,6 +33,10 @@ def parse_args(argv=None):
     p.add_argument("--limit-rows", type=int, default=None,
                    help="dry-run on the first N S1 entities (no stage marking)")
     p.add_argument("--channels", default=None, help="comma-separated channel subset")
+    p.add_argument("--n-jobs", type=int, default=None,
+                   help="worker processes (default: cfg.execution.n_jobs)")
+    p.add_argument("--max-spread", type=int, default=None,
+                   help="TOTAL transient nnz budget across workers")
     args = p.parse_args(argv)
     args.channel_subset = args.channels.split(",") if args.channels else None
     return args
@@ -61,7 +65,9 @@ def main(argv=None) -> int:
 
     summary = run_retrieval(cfg, split=args.split, limit_rows=args.limit_rows,
                             dry_run=args.limit_rows is not None,
-                            channel_subset=args.channel_subset, log=log)
+                            channel_subset=args.channel_subset,
+                            n_jobs=args.n_jobs, max_spread=args.max_spread,
+                            log=log)
     if full_run:
         base = candidates_dir(cfg, args.split)
         rels = [f"candidates/{args.split}/{f.name}"
@@ -74,7 +80,8 @@ def main(argv=None) -> int:
                    peak_rss_mb=summary.get("peak_rss_mb"))
     print("\n=== CANDIDATES SUMMARY ===")
     for k in ("n_pool", "n_s1", "total_pairs", "parts", "channels", "pair_recall",
-              "avg_candidates_per_entity", "elapsed_s", "peak_rss_mb"):
+              "avg_candidates_per_entity", "missed_pairs_total",
+              "elapsed_s", "n_jobs", "peak_rss_mb"):
         print(f"  {k}: {summary.get(k)}")
     print(f"  report: {candidates_dir(cfg, args.split, bool(args.limit_rows))}"
           f"/retrieval_report.txt")

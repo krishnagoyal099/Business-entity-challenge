@@ -428,3 +428,34 @@ def build_views(df: pd.DataFrame, cfg=None, source_key: Optional[str] = None,
     if "country" in fields:
         df["country_norm"] = [build_country(v) for v in df[cols["country"]].tolist()]
     return df
+
+
+# ---------------------------------------------------------------------------
+# alias-aware name keys (Phase 5 revision)
+# ---------------------------------------------------------------------------
+
+_ALIAS_RE = re.compile(
+    r"(?<!\w)(?:aka|a\.k\.a\.?|dba|d\.b\.a\.?|doing business as|fka|"
+    r"f\.k\.a\.?|formerly known as|trading as)(?!\w)", re.IGNORECASE)
+
+
+def name_segments(raw: Any) -> List[str]:
+    """Split a raw name on alias markers (aka / dba / doing business as ...)."""
+    text = "" if raw is None else str(raw)
+    return [seg.strip() for seg in _ALIAS_RE.split(text) if seg and seg.strip()]
+
+
+def build_name_keys(raw: Any) -> Tuple[str, ...]:
+    """Exact-join keys for a name: whole-name core_sorted first, then the
+    core_sorted of each alias segment (deduped, non-empty)."""
+    keys: List[str] = []
+    whole = build_name_views(raw, build_phonetic=False).core_sorted
+    if whole:
+        keys.append(whole)
+    segs = name_segments(raw)
+    if len(segs) > 1:
+        for seg in segs:
+            k = build_name_views(seg, build_phonetic=False).core_sorted
+            if k and k not in keys:
+                keys.append(k)
+    return tuple(keys)

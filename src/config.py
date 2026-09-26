@@ -127,16 +127,24 @@ class NormalizationCfg:
 
 @dataclass
 class RetrievalCfg:
-    """Phase 5 candidate generation settings."""
+    """Phase 5 candidate generation settings (5b: word_addr added, char_addr
+    off by default, rare threshold re-scaled to full-pool df, char_name
+    max_df loosened)."""
     s1_chunk_rows: int = 25_000
-    max_spread: int = 150_000_000      # transient nnz budget per matmul chunk
+    # TOTAL transient nnz budget across all workers; the per-chunk budget is
+    # max_spread // n_jobs, so memory stays bounded under parallelism.
+    max_spread: int = 150_000_000
     normalize_part_rows: int = 500_000
+    part_target_pairs: int = 2_000_000   # candidate pairs aggregated per part file
+    missed_pair_sample: int = 300        # rows in missed_pairs_sample.tsv (0=off)
     channels: Dict[str, Dict[str, Any]] = field(default_factory=lambda: {
         "exact": {"enabled": True, "k": 100, "max_postings": 300},
-        "char_name": {"enabled": True, "k": 50, "max_df": 0.005},
+        "char_name": {"enabled": True, "k": 50, "max_df": 0.02},
         "word_name": {"enabled": True, "k": 30, "max_df": 0.02},
-        "rare": {"enabled": True, "k": 30, "max_df_abs": 50},
-        "char_addr": {"enabled": True, "k": 30, "max_df": 0.01},
+        "rare": {"enabled": True, "k": 30, "max_df_abs": 1000},
+        "word_addr": {"enabled": True, "k": 50, "max_df": 0.02},
+        # char_addr: ~5GB matrix; for a 32GB-instance experiment.
+        "char_addr": {"enabled": False, "k": 30, "max_df": 0.01},
     })
 
 

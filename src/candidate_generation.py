@@ -1,24 +1,27 @@
-"""High-recall candidate generation (Phase 5).
+"""High-recall candidate generation (Phase 5 / 5b).
 
-Unified engine:
-- Vector channels (char/word TF-IDF): fit_transform on the pool's normalized
-  parquet column (streamed); queries transformed from S1 columns. Retrieval =
-  chunked sparse matmul (Q_chunk @ P.T) + per-row top-k. Chunks are packed by
-  SPREAD = summed pool df of the chunk's retained terms, bounding transient
-  memory regardless of common-name queries.
-- Exact channel: capped hash join on name_core_sorted.
-- Union with provenance: channel bitmask + per-channel rank/score, deduped per
-  chunk via combined int64 keys, written as parquet parts.
+- word_addr channel (word TF-IDF over addr_core_joined): links pairs whose
+  names differ (renamed / cross-script) but whose addresses match.
+- Variant channels (word_name, rare): alias segments become separate pool AND
+  query documents; results are mapped back and min-rank deduped per pair.
+  Exact channel indexes variant keys.
+- Parallel chunk workers (fork): per-chunk spread budget = max_spread //
+  n_jobs, so TOTAL transient memory stays bounded; chunk CONTENT is
+  independent of n_jobs (only part grouping changes), guarded by a chunk
+  signature in the resume manifest. Workers never touch boto3.
+- Parts are aggregated to part_target_pairs rows per file.
 
-Leakage contract: pool statistics (df/IDF, postings) derive from pool TEXT only
-- no labels - and the identical procedure runs at test time. Candidates are
+Leakage contract unchanged: pool statistics are label-free; candidates are
 generated once per split and shared across OOF folds.
 """
 from __future__ import annotations
 
 import gc
+import hashlib
 import itertools
+import json
 import logging
+import multiprocessing
 import shutil
 import time
 from pathlib import Path
@@ -30,19 +33,21 @@ import pyarrow.parquet as pq
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 from .aws_utils import local_artifact_path, publish_artifact, read_json, write_json
-from .blocking import build_exact_index, ensure_normalized, iter_column, load_ids
+from .blocking import (code_fingerprint, ensure_normalized, iter_column,
+                       iter_variants, load_ids)
 from .data_loader import source_available
 from .logging_utils import stage_timer
 
 log = logging.getLogger(__name__)
 
-CHANNELS = ("exact", "char_name", "word_name", "rare", "char_addr")
+CHANNELS = ("exact", "char_name", "word_name", "rare", "word_addr", "char_addr")
 CHANNEL_BIT = {c: 1 << i for i, c in enumerate(CHANNELS)}
 RANK_COLUMNS = {c: f"rank_{c}" for c in CHANNELS}
 SCORE_COLUMNS = {c: f"score_{c}" for c in
-                 ("char_name", "word_name", "rare", "char_addr")}
-CHANNEL_COLUMN = {"char_name": "name_alnum", "word_name": "name_core_joined",
-                  "rare": "name_core_joined", "char_addr": "addr_alnum"}
+                 ("char_name", "word_name", "rare", "word_addr", "char_addr")}
+
+# worker state, populated before fork and read inside _process_chunk
+_CH_STATE: Dict[str, Any] = {}
 
 
 def candidates_rel(split: str, dry_run: bool = False) -> str:
@@ -62,8 +67,6 @@ def candidates_dir(cfg, split: str, dry_run: bool = False) -> Path:
 
 def _pack_chunks(spread: np.ndarray, max_spread: float,
                  max_rows: int) -> List[Tuple[int, int]]:
-    """Greedily pack contiguous query rows into (start, end) chunks whose summed
-    spread stays within budget; a single row always forms a chunk."""
     chunks: List[Tuple[int, int]] = []
     start = 0
     acc = 0.0
@@ -86,7 +89,6 @@ def _empty_result():
 
 
 def _topk_rows(S, k: int, row_offset: int):
-    """Per-row top-k from a chunk similarity CSR -> (q_idx, pool_idx, rank, score)."""
     indptr, indices, data = S.indptr, S.indices, S.data
     qs, ps, rs, ss = [], [], [], []
     for i in range(S.shape[0]):
@@ -109,22 +111,17 @@ def _topk_rows(S, k: int, row_offset: int):
             np.concatenate(rs), np.concatenate(ss))
 
 
-def _exact_channel_chunk(exact_index: Dict[str, List[int]], query_keys: List[str],
-                         k: int, start: int, end: int):
-    qs, ps, rs = [], [], []
-    for i in range(start, end):
-        key = query_keys[i]
-        posts = exact_index.get(key) if key else None
-        if not posts:
-            continue
-        take = posts[:k]
-        qs.append(np.full(len(take), i, dtype=np.int32))
-        ps.append(np.asarray(take, dtype=np.int32))
-        rs.append(np.arange(1, len(take) + 1, dtype=np.uint8))
-    if not qs:
-        return _empty_result()
-    r = np.concatenate(rs)
-    return np.concatenate(qs), np.concatenate(ps), r, np.ones(r.size, np.float32)
+def _reduce_pairs(q, p, r, s, n_pool: int):
+    """Collapse duplicate (row, pool) pairs from variant docs: min rank, max score."""
+    if q.size <= 1:
+        return q, p, r, s
+    keys = q.astype(np.int64) * n_pool + p.astype(np.int64)
+    order = np.lexsort((r, keys))
+    first = np.r_[True, keys[order][1:] != keys[order][:-1]]
+    sel = order[first]
+    order2 = np.lexsort((-s.astype(np.float32), keys))
+    first2 = np.r_[True, keys[order2][1:] != keys[order2][:-1]]
+    return q[sel], p[sel], r[sel], s[order2[first2]]
 
 
 def _merge_channel_results(n_pool: int, per_channel: Dict[str, Tuple]
@@ -155,33 +152,111 @@ def _merge_channel_results(n_pool: int, per_channel: Dict[str, Tuple]
             "channel_bits": bits, "ranks": ranks, "scores": scores}
 
 
-def _build_tfidf_channel(name: str, pool_paths, params: Dict[str, Any],
-                         query_docs: List[str]):
-    column = CHANNEL_COLUMN[name]
-    k = int(params.get("k", 30))
-    if name in ("char_name", "char_addr"):
+def _concat_merged(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "s1_idx": np.concatenate([m["s1_idx"] for m in items]),
+        "pool_idx": np.concatenate([m["pool_idx"] for m in items]),
+        "channel_bits": np.concatenate([m["channel_bits"] for m in items]),
+        "ranks": {c: np.concatenate([m["ranks"][c] for m in items])
+                  for c in CHANNELS},
+        "scores": {c: np.concatenate([m["scores"][c] for m in items])
+                   for c in SCORE_COLUMNS},
+    }
+    out["n"] = int(out["s1_idx"].size)
+    return out
+
+
+def _make_tfidf(kind: str, params: Dict[str, Any], pool_docs, query_docs):
+    if kind == "char":
         vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 3),
-                              max_df=float(params.get("max_df", 0.01)),
+                              max_df=float(params.get("max_df", 0.02)),
                               dtype=np.float32, sublinear_tf=True)
     else:
         abs_df = params.get("max_df_abs")
         max_df = (int(abs_df) if abs_df is not None
                   else float(params.get("max_df", 0.02)))
-        vec = TfidfVectorizer(analyzer=str.split, lowercase=False, max_df=max_df,
-                              dtype=np.float32, sublinear_tf=True)
-    pool_mat = vec.fit_transform(iter_column(pool_paths, column))
-    q_mat = vec.transform(query_docs)
-    return vec, pool_mat, q_mat, k
+        vec = TfidfVectorizer(analyzer=str.split, lowercase=False,
+                              max_df=max_df, dtype=np.float32,
+                              sublinear_tf=True)
+    P = vec.fit_transform(pool_docs)
+    Q = vec.transform(query_docs)
+    return vec, P, Q, int(params.get("k", 30))
 
 
-# ---------------------------------------------------------------------------
-# orchestration
-# ---------------------------------------------------------------------------
+def _expand_variant_docs(paths, limit: Optional[int] = None
+                         ) -> Tuple[List[str], np.ndarray, np.ndarray]:
+    """(docs, row_map, offsets): every row contributes >= 1 doc, so offsets
+    are strictly increasing."""
+    docs: List[str] = []
+    row_map: List[int] = []
+    counts: List[int] = []
+    it = iter_variants(paths)
+    if limit is not None:
+        it = itertools.islice(it, limit)
+    n = 0
+    for i, variants in enumerate(it):
+        kept = [v for v in variants if v] or [""]
+        for v in kept:
+            docs.append(v)
+            row_map.append(i)
+        counts.append(len(kept))
+        n = i + 1
+    offsets = np.zeros(n + 1, dtype=np.int64)
+    if n:
+        offsets[1:] = np.cumsum(counts)
+    return docs, np.asarray(row_map, dtype=np.int32), offsets
 
 
-def _write_ids_parquet(path: Path, ids: np.ndarray) -> None:
-    pq.write_table(pa.table({"entity_id": pa.array(ids.tolist(), type=pa.string())}),
-                   path, compression="snappy")
+def _variant_key(v: str) -> str:
+    return " ".join(sorted(v.split()))
+
+
+def _build_exact_index_variants(pool_paths, cap: int
+                                ) -> Tuple[Dict[str, List[int]], int]:
+    index: Dict[str, List[int]] = {}
+    truncated = 0
+    for i, variants in enumerate(iter_variants(pool_paths)):
+        for v in variants:
+            if not v:
+                continue
+            key = _variant_key(v)
+            posts = index.get(key)
+            if posts is None:
+                index[key] = [i]
+            elif posts[-1] != i:
+                if len(posts) < cap:
+                    posts.append(i)
+                else:
+                    truncated += 1
+    return index, truncated
+
+
+def _exact_channel_chunk(index: Dict[str, List[int]],
+                         query_key_variants: List[List[str]], k: int,
+                         start: int, end: int):
+    qs, ps, rs = [], [], []
+    for i in range(start, end):
+        seen: set = set()
+        for key in query_key_variants[i]:
+            posts = index.get(key) if key else None
+            if not posts:
+                continue
+            take = [t for t in posts[:k] if t not in seen]
+            if not take:
+                continue
+            seen.update(take)
+            qs.append(np.full(len(take), i, dtype=np.int32))
+            ps.append(np.asarray(take, dtype=np.int32))
+            rs.append(np.arange(1, len(take) + 1, dtype=np.uint8))
+    if not qs:
+        return _empty_result()
+    r = np.concatenate(rs)
+    return np.concatenate(qs), np.concatenate(ps), r, np.ones(r.size, np.float32)
+
+
+def _chunk_signature(chunks: List[Tuple[int, int]]) -> str:
+    blob = json.dumps([list(c) for c in chunks], separators=(",", ":"))
+    return hashlib.sha1(blob.encode()).hexdigest()[:12]
 
 
 def _write_candidate_part(out_dir: Path, name: str, merged: Dict[str, Any]) -> int:
@@ -197,15 +272,63 @@ def _write_candidate_part(out_dir: Path, name: str, merged: Dict[str, Any]) -> i
     return table.num_rows
 
 
+# ---------------------------------------------------------------------------
+# chunk worker (parent process or forked child; reads only _CH_STATE)
+# ---------------------------------------------------------------------------
+
+
+def _process_chunk(ci: int) -> Dict[str, Any]:
+    ch = _CH_STATE
+    start, end = ch["chunks"][ci]
+    per_channel: Dict[str, Tuple] = {}
+    for name, m in ch["matrices"].items():
+        if m["offsets"] is not None:          # variant channel: expanded rows
+            es, ee = int(m["offsets"][start]), int(m["offsets"][end])
+            if ee <= es:
+                continue
+            S = (m["Q"][es:ee] @ m["PT"]).tocsr()
+            q, p, r, s = _topk_rows(S, m["k"], es)
+            del S
+            if q.size:
+                q = m["row_map"][q]
+                p = m["pool_map"][p]
+                q, p, r, s = _reduce_pairs(q, p, r, s, ch["n_pool"])
+        else:                                 # identity channel
+            S = (m["Q"][start:end] @ m["PT"]).tocsr()
+            q, p, r, s = _topk_rows(S, m["k"], start)
+            del S
+        if q.size:
+            per_channel[name] = (q, p, r, s)
+    if ch["exact_index"] is not None:
+        q, p, r, s = _exact_channel_chunk(ch["exact_index"],
+                                          ch["query_exact_keys"],
+                                          ch["k_exact"], start, end)
+        if q.size:
+            per_channel["exact"] = (q, p, r, s)
+    merged = _merge_channel_results(ch["n_pool"], per_channel)
+    return {"ci": ci, "start": start, "end": end,
+            "rows": merged["n"] if merged else 0, "merged": merged}
+
+
+# ---------------------------------------------------------------------------
+# orchestration
+# ---------------------------------------------------------------------------
+
+
+def _write_ids_parquet(path: Path, ids: np.ndarray) -> None:
+    pq.write_table(pa.table({"entity_id": pa.array(ids.tolist(), type=pa.string())}),
+                   path, compression="snappy")
+
+
 def run_retrieval(cfg, split: str = "train", limit_rows: Optional[int] = None,
                   dry_run: bool = False,
                   channel_subset: Optional[Sequence[str]] = None,
+                  n_jobs: Optional[int] = None, max_spread: Optional[int] = None,
                   log: Optional[logging.Logger] = None) -> Dict[str, Any]:
-    """Generate candidates for a split; resumable at part granularity."""
     t0 = time.time()
     log = log or logging.getLogger(__name__)
     if limit_rows:
-        dry_run = True                 # limited runs are disposable by design
+        dry_run = True
     if dry_run:
         shutil.rmtree(candidates_dir(cfg, split, True), ignore_errors=True)
 
@@ -219,8 +342,8 @@ def run_retrieval(cfg, split: str = "train", limit_rows: Optional[int] = None,
     log.info("pool: %d records; s1 rows: %d (split=%s)", n_pool, n_s1, split)
 
     out_dir = candidates_dir(cfg, split, dry_run)
-    rel = candidates_rel(split, dry_run)
     publish = not dry_run
+    rel = candidates_rel(split, dry_run)
     _write_ids_parquet(out_dir / "s1_ids.parquet", s1_ids[:n_s1])
     _write_ids_parquet(out_dir / "pool_ids.parquet", pool_ids)
     if publish:
@@ -236,98 +359,201 @@ def run_retrieval(cfg, split: str = "train", limit_rows: Optional[int] = None,
     def qdocs(column: str) -> List[str]:
         return list(itertools.islice(iter_column(s1_paths, column), n_s1))
 
-    query_docs = {c: qdocs(c) for c in ("name_alnum", "name_core_joined",
-                                        "addr_alnum", "name_core_sorted")}
+    q_alnum = qdocs("name_alnum")
+    q_addr = qdocs("addr_core_joined")
+    q_addr_alnum = qdocs("addr_alnum") if "char_addr" in channels_cfg else []
+    q_variants, q_row_map, q_offsets = _expand_variant_docs(s1_paths, n_s1)
+    need_variants = any(c in channels_cfg for c in ("word_name", "rare"))
+    pool_variants, pool_map = ([], None)
+    if need_variants:
+        pool_variants, pool_map, _ = _expand_variant_docs(pool_paths)
 
     matrices: Dict[str, Dict[str, Any]] = {}
     spread = np.zeros(n_s1, dtype=np.float64)
-    for name in ("char_name", "word_name", "rare", "char_addr"):
+    plain = {"pool_map": None, "row_map": None, "offsets": None}
+    for name in ("char_name", "word_name", "rare", "word_addr", "char_addr"):
         if name not in channels_cfg:
             continue
-        vec, P, Q, k = _build_tfidf_channel(name, pool_paths, channels_cfg[name],
-                                            query_docs[CHANNEL_COLUMN[name]])
-        term_df = np.asarray(P.getnnz(axis=0), dtype=np.float64)   # per-term df
+        params = channels_cfg[name]
+        if name == "char_name":
+            vec, P, Q, k = _make_tfidf("char", params,
+                                       iter_column(pool_paths, "name_alnum"),
+                                       q_alnum)
+            info = plain
+        elif name == "word_addr":
+            vec, P, Q, k = _make_tfidf(
+                "word", params, iter_column(pool_paths, "addr_core_joined"),
+                q_addr)
+            info = plain
+        elif name == "char_addr":
+            vec, P, Q, k = _make_tfidf(
+                "char", params, iter_column(pool_paths, "addr_alnum"),
+                q_addr_alnum)
+            info = plain
+        else:                                   # word_name / rare: variants
+            vec, P, Q, k = _make_tfidf("word", params, pool_variants, q_variants)
+            info = {"pool_map": pool_map, "row_map": q_row_map,
+                    "offsets": q_offsets}
+        df = np.asarray(P.getnnz(axis=0)).ravel().astype(np.float64)  # per TERM
+        PT = P.T.tocsr()                        # built once, reused per chunk
+        del P
         Qb = Q.copy()
         Qb.data = np.ones_like(Qb.data)
-        spread = np.maximum(spread, np.asarray(Qb @ term_df).reshape(-1))
-        PT = P.T.tocsr()               # (V x n_pool), built once for all chunks
-        matrices[name] = {"PT": PT, "Q": Q, "k": k}
-        del P, Qb
-        log.info("channel %s: vocab=%d nnz=%d empty_queries=%d", name,
+        spread_ch = np.asarray(Qb @ df).ravel()
+        if info["offsets"] is not None:
+            spread_ch = np.add.reduceat(spread_ch, info["offsets"][:-1])
+        spread = np.maximum(spread, spread_ch[:n_s1])
+        matrices[name] = {"Q": Q, "PT": PT, "k": k, **info}
+        log.info("channel %s: vocab=%d pool_nnz=%d empty_queries=%d", name,
                  len(vec.vocabulary_), PT.nnz, int((Q.getnnz(axis=1) == 0).sum()))
         gc.collect()
+    pool_variants = []
 
-    exact_index, exact_trunc = None, 0
+    exact_index, exact_trunc, k_exact = None, 0, 0
     if "exact" in channels_cfg:
-        exact_index, exact_trunc = build_exact_index(
-            pool_paths, "name_core_sorted",
-            int(channels_cfg["exact"].get("max_postings", 300)))
+        k_exact = int(channels_cfg["exact"].get("k", 100))
+        exact_index, exact_trunc = _build_exact_index_variants(
+            pool_paths, int(channels_cfg["exact"].get("max_postings", 300)))
         log.info("channel exact: %d keys (truncated postings: %d)",
                  len(exact_index), exact_trunc)
+    query_exact_keys: List[List[str]] = [
+        [_variant_key(v) for v in variants if v] or [""]
+        for variants in itertools.islice(iter_variants(s1_paths), n_s1)]
 
-    chunks = _pack_chunks(spread, float(cfg.retrieval.max_spread),
-                          int(cfg.retrieval.s1_chunk_rows))
-    log.info("retrieval plan: %d chunks (avg rows/chunk=%.0f)", len(chunks),
-             n_s1 / max(1, len(chunks)))
+    can_fork = "fork" in multiprocessing.get_all_start_methods()
+    n_jobs_eff = max(1, int(n_jobs if n_jobs is not None
+                            else getattr(cfg.execution, "n_jobs", 1)))
+    parallel = n_jobs_eff > 1 and can_fork
+    budget = max(1, int((max_spread if max_spread is not None
+                         else cfg.retrieval.max_spread)
+                        // (n_jobs_eff if parallel else 1)))
+    chunks = _pack_chunks(spread, float(budget), int(cfg.retrieval.s1_chunk_rows))
+    sig = _chunk_signature(chunks)
+    log.info("retrieval plan: %d chunks, budget=%d/chunk, n_jobs=%d",
+             len(chunks), budget, n_jobs_eff)
+
+    # ---- resume state: content identity + chunking signature ------------
+    # run_key captures CONTENT-affecting inputs (code + channel params + split).
+    # Layout-only knobs (max_spread, s1_chunk_rows, part_target, n_jobs) are
+    # excluded: they change grouping, never content.
+    here = Path(__file__).resolve().parent
+    content_blob = json.dumps({"split": split, "channels": cfg.retrieval.channels},
+                              sort_keys=True)
+    run_key = (code_fingerprint([here / "normalization.py", here / "blocking.py",
+                                 here / "candidate_generation.py",
+                                 here / "candidate_metrics.py",
+                                 here / "config.py"])
+               + ":" + hashlib.sha1(content_blob.encode()).hexdigest()[:12])
 
     chunks_path = out_dir / "chunks.json"
-    done: List[Dict[str, Any]] = (read_json(chunks_path)
-                                  if chunks_path.exists() else [])
-    known = {c.get("file") for c in done if c.get("file")}
-    for f in out_dir.glob("part_*.parquet"):
-        if f.name not in known:
+    parts_path = out_dir / "parts.json"
+    done_entries: List[Dict[str, Any]] = []
+    part_files: List[str] = []
+    stale = True
+    if chunks_path.exists() and parts_path.exists():
+        stored = read_json(chunks_path) or {}
+        if stored.get("run_key") == run_key and stored.get("signature") == sig:
+            done_entries = [e for e in stored.get("entries", []) if "merged" not in e]
+            part_files = list(read_json(parts_path) or [])
+            stale = False
+        else:
+            reason = ("content changed" if stored.get("run_key") != run_key
+                      else "chunking changed")
+            log.warning("candidate resume state discarded (%s); regenerating "
+                        "all parts", reason)
+    if stale:
+        part_files = []
+        for f in out_dir.glob("part_*.parquet"):
             f.unlink()
-    total_pairs = sum(int(c.get("rows", 0)) for c in done)
+        for f in (parts_path, chunks_path):
+            if f.exists():
+                f.unlink()
+    else:
+        known = set(part_files)
+        for f in out_dir.glob("part_*.parquet"):
+            if f.name not in known:
+                f.unlink()
+    done_ids = {int(e["ci"]) for e in done_entries}
+    pending = [ci for ci in range(len(chunks)) if ci not in done_ids]
+    part_target = max(1, int(cfg.retrieval.part_target_pairs))
+
+    _CH_STATE.clear()
+    _CH_STATE.update({"chunks": chunks, "matrices": matrices, "n_pool": n_pool,
+                      "exact_index": exact_index, "k_exact": k_exact,
+                      "query_exact_keys": query_exact_keys})
+
+    state = {"buffer": [], "buffer_pairs": 0, "unflushed": [], "completed":
+             len(done_entries), "pairs": sum(int(e.get("rows", 0))
+                                             for e in done_entries)}
+
+    def _save_chunks() -> None:
+        write_json(chunks_path, {"signature": sig, "run_key": run_key,
+                                 "entries": done_entries})
+        if publish:
+            publish_artifact(cfg, f"{rel}/chunks.json")
+
+    def _flush() -> None:
+        if state["buffer"]:
+            name = f"part_{len(part_files):04d}.parquet"
+            _write_candidate_part(out_dir, name, _concat_merged(state["buffer"]))
+            part_files.append(name)
+            write_json(parts_path, part_files)
+            if publish:
+                publish_artifact(cfg, f"{rel}/{name}")
+                publish_artifact(cfg, f"{rel}/parts.json")
+            state["buffer"], state["buffer_pairs"] = [], 0
+        done_entries.extend(state["unflushed"])
+        state["unflushed"] = []
+        _save_chunks()
+
+    def _record(res: Dict[str, Any]) -> None:
+        merged = res.pop("merged", None)
+        rows = int(res.get("rows", 0))
+        state["unflushed"].append({"ci": res["ci"], "start": res["start"],
+                                   "end": res["end"], "rows": rows})
+        if merged is not None and merged.get("n"):
+            state["buffer"].append(merged)
+            state["buffer_pairs"] += merged["n"]
+        state["completed"] += 1
+        state["pairs"] += rows
+        if state["buffer_pairs"] >= part_target:
+            _flush()
+        if state["completed"] % 50 == 0 or state["completed"] == len(chunks):
+            el = time.time() - t0
+            log.info("chunks %d/%d: pairs=%d elapsed=%.0fs eta=%.0fs",
+                     state["completed"], len(chunks), state["pairs"], el,
+                     el / max(1, state["completed"]) *
+                     (len(chunks) - state["completed"]))
 
     timer = stage_timer(f"candidates[{split}]", cfg)
     timer.start()
-    for ci, (start, end) in enumerate(chunks):
-        if ci < len(done):
-            continue
-        per_channel: Dict[str, Tuple] = {}
-        for name, m in matrices.items():
-            S = (m["Q"][start:end] @ m["PT"]).tocsr()
-            res = _topk_rows(S, m["k"], start)
-            del S
-            if res[0].size:
-                per_channel[name] = res
-        if exact_index is not None:
-            res = _exact_channel_chunk(
-                exact_index, query_docs["name_core_sorted"],
-                int(channels_cfg["exact"].get("k", 100)), start, end)
-            if res[0].size:
-                per_channel["exact"] = res
-        merged = _merge_channel_results(n_pool, per_channel)
-        part_name = f"part_{ci:04d}.parquet"
-        rows = 0
-        if merged is not None:
-            rows = _write_candidate_part(out_dir, part_name, merged)
-            if publish:
-                publish_artifact(cfg, f"{rel}/{part_name}")
-        done.append({"start": start, "end": end,
-                     "file": part_name if rows else None, "rows": rows})
-        write_json(chunks_path, done)
-        if publish:
-            publish_artifact(cfg, f"{rel}/chunks.json")
-        total_pairs += rows
-        if (ci + 1) % 5 == 0 or ci == len(chunks) - 1:
-            el = time.time() - t0
-            log.info("chunk %d/%d: pairs=%d elapsed=%.0fs eta=%.0fs",
-                     ci + 1, len(chunks), total_pairs, el,
-                     el / (ci + 1) * (len(chunks) - ci - 1))
+    if parallel:
+        try:
+            ctx = multiprocessing.get_context("fork")
+            with ctx.Pool(processes=n_jobs_eff) as pool:
+                for res in pool.imap_unordered(_process_chunk, pending):
+                    _record(res)
+        except Exception as exc:            # keep resume state, go serial
+            log.warning("parallel retrieval failed (%s); serial fallback", exc)
+    finished = ({int(e["ci"]) for e in done_entries}
+                | {int(e["ci"]) for e in state["unflushed"]})
+    for ci in pending:
+        if ci not in finished:
+            _record(_process_chunk(ci))
+    _flush()
     timer.stop()
-
-    del matrices, exact_index
+    _CH_STATE.clear()
+    del matrices, exact_index, query_exact_keys
     gc.collect()
 
     summary: Dict[str, Any] = {
         "split": split, "n_pool": n_pool, "n_s1": n_s1,
-        "total_pairs": total_pairs,
-        "parts": sum(1 for c in done if c.get("rows")),
+        "total_pairs": sum(int(e.get("rows", 0)) for e in done_entries),
+        "parts": len(part_files),
         "channels": sorted(channels_cfg.keys()),
         "exact_truncated_keys": exact_trunc,
-        "elapsed_s": round(time.time() - t0, 1), "dry_run": dry_run,
-        "peak_rss_mb": timer.peak_rss_mb,
+        "n_jobs": n_jobs_eff, "elapsed_s": round(time.time() - t0, 1),
+        "dry_run": dry_run, "peak_rss_mb": timer.peak_rss_mb,
     }
 
     gt_file = getattr(getattr(cfg.data, split), "ground_truth", "")
@@ -339,4 +565,5 @@ def run_retrieval(cfg, split: str = "train", limit_rows: Optional[int] = None,
         write_report(cfg, split, report, dry_run=dry_run)
         summary["pair_recall"] = report.get("pair_recall")
         summary["avg_candidates_per_entity"] = report.get("avg_candidates_per_entity")
+        summary["missed_pairs_total"] = report.get("missed_pairs_total")
     return summary

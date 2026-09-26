@@ -7,7 +7,7 @@ URL prefix stripping.
 import pytest
 
 from src.data_loader import load_source
-from src.normalization import (AddressViews, NameViews, build_address_views,
+from src.normalization import (build_name_keys, name_segments, AddressViews, NameViews, build_address_views,
                                build_country, build_name_views, build_views,
                                char_ngrams, fold_latin_diacritics,
                                normalize_address, normalize_name, soundex,
@@ -164,3 +164,20 @@ def test_build_views_dataframe(synth):
     row = out.iloc[0]
     assert row["name_core"] == ["acme"] and row["country_norm"] == "us"
     assert out.iloc[3]["addr_core_sorted"] == ""
+
+
+def test_alias_segments_and_keys():
+    assert name_segments("Lyraumbra D.B.A. S+ Aspac L.L.C.") ==         ["Lyraumbra", "S+ Aspac L.L.C."]
+    assert name_segments("Ectokelo Labs doing business as Improve Products LLP") ==         ["Ectokelo Labs", "Improve Products LLP"]
+    keys = build_name_keys("Rizaevo aka Custom Total LLC")
+    assert "custom total" in keys and "custom rizaevo total" in keys
+    assert build_name_keys("Custom Total LLC") == ("custom total",)
+    assert build_name_keys("") == ()
+    assert "aspac" in build_name_keys("S+ Aspac L.L.C.")
+    assert "aspac" in build_name_keys("Lyraumbra D.B.A. S+ Aspac L.L.C.")
+
+
+def test_alias_marker_needs_word_boundary():
+    assert name_segments("Akai Electronics") == ["Akai Electronics"]
+    assert name_segments("Dbacorp Ltd") == ["Dbacorp Ltd"]
+    assert name_segments("Fkathleen Smith") == ["Fkathleen Smith"]
