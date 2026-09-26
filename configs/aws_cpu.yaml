@@ -57,3 +57,19 @@ schema:                       # locked from provided data samples
     source2: {id: entity_id, name: business_name, address: business_address, country: country}
     source3: {id: entity_id, name: business_name, address: business_address, country: country}
     ground_truth: {s1_id: source1_entity_id, matches: matched_entity_ids}
+
+# Retrieval settings for the big-instance runs. `char_addr` is ON here
+# (typo'd addresses); `rare` stays enabled because its score is a feature.
+retrieval:
+  s1_chunk_rows: 25000
+  max_spread: 150000000
+  normalize_part_rows: 500000
+  part_target_pairs: 2000000
+  missed_pair_sample: 300
+  channels:
+    exact: {enabled: true, k: 100, max_postings: 300}
+    char_name: {enabled: true, k: 50, max_df: 0.02}
+    word_name: {enabled: true, k: 30, max_df: 0.02}
+    rare: {enabled: true, k: 30, max_df_abs: 1000}
+    word_addr: {enabled: true, k: 50, max_df: 0.02}
+    char_addr: {enabled: true, k: 30, max_df: 0.01}
