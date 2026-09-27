@@ -158,3 +158,12 @@ def test_full_pipeline_train_to_submission(synth, tmp_path):
     cand_lines = (Path(cfg.paths.output_dir) / "candidate_pairs.tsv"
                   ).read_text(encoding="utf-8").splitlines()
     assert cand_lines[0] == "source1_entity_id\tcandidate_entity_ids"
+
+    # same run with the Bayes policy
+    write_json(mdir / "policy.json", {"kind": "bayes", "temperature": 1.0,
+                                      "max_emit": 15, "window": 25})
+    assert predict_test.main(["--config", str(conf), "--n-jobs", "1"]) == 0
+    lines = (Path(cfg.paths.output_dir) / "matching_results.tsv"
+             ).read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "source1_entity_id\tmatched_entity_ids"
+    assert len(lines) == 1 + 4
