@@ -1,9 +1,14 @@
 #!/usr/bin/env python
 """Compare decision policies on the holdout; write the winner to policy.json.
 
-Reproduces the v1 threshold number first (sanity), then evaluates the Bayes
-expected-F policy over a temperature grid. The winner (either kind) is written
-to models/verifier_v1/policy.json for predict_test to use.
+Reproduces the v1 threshold number first (sanity), then evaluates, for every
+pool-exclusivity mode (none / hard / soft), a re-tuned threshold policy and the
+Bayes expected-F policy over a temperature grid. The winner (any kind/mode) is
+written to models/verifier_v1/policy.json for predict_test to use.
+
+Exclusivity is evaluated with competition restricted to holdout S1 entities
+(training-row scores are in-sample), so its measured gain is a LOWER bound:
+at test time every S1 entity competes.
 """
 from __future__ import annotations
 
@@ -20,7 +25,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.aws_utils import local_artifact_path, write_json
 from src.candidate_generation import candidates_dir
 from src.config import load_config
-from src.entity_decision import BayesPolicy, evaluate_policy, load_policy
+from src.entity_decision import (EXCLUSIVE_MODES, BayesPolicy, evaluate_policy,
+                                 exclusive_adjust, load_policy, tune_policy)
 from src.evaluator import macro_f05
 from src.ground_truth import load_ground_truth
 from src.logging_utils import setup_logging
@@ -36,6 +42,8 @@ def parse_args(argv=None):
     p.add_argument("--candidates-dir", default=None)
     p.add_argument("--holdout-mod", type=int, default=5)
     p.add_argument("--taus", default="0.6,0.75,0.9,1.0,1.15,1.3,1.5")
+    p.add_argument("--exclusive", default=",".join(EXCLUSIVE_MODES),
+                   help="comma list of pool-exclusivity modes to try")
     p.add_argument("--n-jobs", type=int, default=8)
     return p.parse_args(argv)
 
@@ -95,18 +103,31 @@ def main(argv=None) -> int:
 
     best_pol, best_rep = old, rep0
     rows = []
-    for tau in [float(x) for x in args.taus.split(",")]:
-        pol = BayesPolicy(temperature=tau)
-        rep = evaluate_policy(s1[hold], pool[hold], prob, truth, pol,
-                              n_jobs=args.n_jobs)
-        emitted = (rep.total_tp + rep.total_fp) / rep.n_entities
-        rows.append({"kind": "bayes", "temperature": tau,
-                     "macro_f05": rep.macro_f05, "emitted_per_entity": emitted,
-                     "total_fp": rep.total_fp, "total_fn": rep.total_fn})
-        print(f"bayes tau={tau:<5}  macro_f05={rep.macro_f05:.4f} "
-              f"emitted/entity={emitted:.2f} FP={rep.total_fp} FN={rep.total_fn}")
-        if rep.macro_f05 > best_rep.macro_f05:
-            best_pol, best_rep = pol, rep
+    s_h, p_h = s1[hold], pool[hold]
+    for mode in [m.strip() for m in args.exclusive.split(",") if m.strip()]:
+        # tune on raw probs: evaluate_policy applies the policy's own mode
+        tpol, trep, _ = tune_policy(s_h, p_h, prob, truth, log=log, exclusive=mode)
+        rows.append({"kind": "threshold", "exclusive": mode,
+                     "threshold": tpol.threshold, "macro_f05": trep.macro_f05,
+                     "total_fp": trep.total_fp, "total_fn": trep.total_fn})
+        print(f"threshold excl={mode:<4} t={tpol.threshold:.3f} "
+              f"macro_f05={trep.macro_f05:.4f} FP={trep.total_fp} FN={trep.total_fn}")
+        if trep.macro_f05 > best_rep.macro_f05:
+            best_pol, best_rep = tpol, trep
+        n_changed = int((exclusive_adjust(p_h, prob, mode) != prob).sum())
+        log.info("exclusive=%s changes %d / %d holdout pair probs",
+                 mode, n_changed, prob.size)
+        for tau in [float(x) for x in args.taus.split(",")]:
+            pol = BayesPolicy(temperature=tau, exclusive=mode)
+            rep = evaluate_policy(s_h, p_h, prob, truth, pol, n_jobs=args.n_jobs)
+            emitted = (rep.total_tp + rep.total_fp) / rep.n_entities
+            rows.append({"kind": "bayes", "exclusive": mode, "temperature": tau,
+                         "macro_f05": rep.macro_f05, "emitted_per_entity": emitted,
+                         "total_fp": rep.total_fp, "total_fn": rep.total_fn})
+            print(f"bayes excl={mode:<4} tau={tau:<5} macro_f05={rep.macro_f05:.4f} "
+                  f"emitted/entity={emitted:.2f} FP={rep.total_fp} FN={rep.total_fn}")
+            if rep.macro_f05 > best_rep.macro_f05:
+                best_pol, best_rep = pol, rep
 
     write_json(mdir / "policy.json", best_pol.to_dict())
     write_json(mdir / "policy_eval.json",

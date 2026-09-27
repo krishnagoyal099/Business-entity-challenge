@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.aws_utils import local_artifact_path, mark_stage, publish_artifact, write_json
 from src.candidate_generation import candidates_dir
 from src.config import load_config
-from src.entity_decision import tune_policy
+from src.entity_decision import EXCLUSIVE_MODES, tune_policy
 from src.evaluator import macro_f05
 from src.ground_truth import load_ground_truth
 from src.logging_utils import setup_logging, stage_timer
@@ -130,7 +130,12 @@ def main(argv=None) -> int:
 
     timer = stage_timer("train_v1", cfg)
     timer.start()
-    policy, report, table = tune_policy(s1[hold], pool[hold], prob, truth, log=log)
+    policy = report = table = None
+    for mode in EXCLUSIVE_MODES:     # holdout-only competition: lower-bound gain
+        pol_m, rep_m, tab_m = tune_policy(s1[hold], pool[hold], prob, truth,
+                                          log=log, exclusive=mode)
+        if report is None or rep_m.macro_f05 > report.macro_f05:
+            policy, report, table = pol_m, rep_m, tab_m
     timer.stop()
 
     mdir = local_artifact_path(cfg, args.model_dir + "/model.txt").parent

@@ -21,9 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.aws_utils import local_artifact_path, publish_artifact
 from src.candidate_generation import candidates_dir
 from src.config import load_config
-from src.entity_decision import (BayesPolicy, DecisionPolicy, load_policy,
-                                 make_entity_predictions,
-                                 make_entity_predictions_bayes)
+from src.entity_decision import DecisionPolicy, decide, load_policy
 from src.logging_utils import setup_logging, stage_timer
 from src.model import load_feature_names, load_model, predict_scores
 from src.pair_features import LEGACY_FEATURE_COLUMNS
@@ -37,6 +35,8 @@ def parse_args(argv=None):
     p.add_argument("--policy", default=None)
     p.add_argument("--threshold", type=float, default=None,
                    help="override for threshold-kind policies only")
+    p.add_argument("--exclusive", default=None, choices=("none", "hard", "soft"),
+                   help="override the policy's pool-exclusivity mode")
     p.add_argument("--cand-top", type=int, default=50)
     p.add_argument("--n-jobs", type=int, default=8)
     return p.parse_args(argv)
@@ -54,6 +54,8 @@ def main(argv=None) -> int:
     policy = load_policy(pol_path)
     if args.threshold is not None and isinstance(policy, DecisionPolicy):
         policy.threshold = float(args.threshold)
+    if args.exclusive is not None:
+        policy.exclusive = args.exclusive
     log.info("policy: %s", policy.to_dict())
 
     cand_base = candidates_dir(cfg, "test")
@@ -98,11 +100,8 @@ def main(argv=None) -> int:
     del all_s, all_p, all_pr, cand_s, cand_p
     log.info("scored %d pairs; running decision policy...", ks.size)
 
-    if isinstance(policy, BayesPolicy):
-        preds_idx = make_entity_predictions_bayes(ks, kp, kpr, policy,
-                                                  n_jobs=args.n_jobs)
-    else:
-        preds_idx = make_entity_predictions(ks, kp, kpr, policy)
+    # exclusivity sees every S1 entity's pairs at once (all parts concatenated)
+    preds_idx = decide(ks, kp, kpr, policy, n_jobs=args.n_jobs)
     timer.stop()
 
     preds = {s1_ids[a]: {pool_ids[b] for b in bs} for a, bs in preds_idx.items()}

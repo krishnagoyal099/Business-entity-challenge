@@ -6,6 +6,12 @@ Poisson-binomial distributions over a top-window plus a Poisson tail. It covers
 activation, singleton hedging, cardinality estimation and the zero-match
 firewall in one policy; the only tuned knob is a calibration temperature on the
 logits. The threshold policy (v1) is kept as baseline and fallback.
+
+Both policies carry an `exclusive` mode: every S2/S3 record belongs to AT MOST
+ONE S1 entity (verified on the full train GT), so pair probabilities are first
+reconciled across the S1 entities competing for the same pool record:
+"hard" keeps only the top-scoring S1 per pool record, "soft" rescales so a pool
+record's probabilities sum to at most 1, "none" leaves them unchanged.
 """
 from __future__ import annotations
 
@@ -24,19 +30,24 @@ from .evaluator import MetricsReport, macro_f05
 log = logging.getLogger(__name__)
 
 
+EXCLUSIVE_MODES = ("none", "hard", "soft")
+
+
 @dataclass
 class DecisionPolicy:
     threshold: float = 0.5
     max_emit: int = 15
+    exclusive: str = "none"
 
     def to_dict(self) -> Dict[str, Any]:
         return {"kind": "threshold", "threshold": round(float(self.threshold), 4),
-                "max_emit": int(self.max_emit)}
+                "max_emit": int(self.max_emit), "exclusive": self.exclusive}
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "DecisionPolicy":
         return cls(threshold=float(d["threshold"]),
-                   max_emit=int(d.get("max_emit", 15)))
+                   max_emit=int(d.get("max_emit", 15)),
+                   exclusive=str(d.get("exclusive", "none")))
 
 
 @dataclass
@@ -44,10 +55,12 @@ class BayesPolicy:
     temperature: float = 1.0
     max_emit: int = 15
     window: int = 25
+    exclusive: str = "none"
 
     def to_dict(self) -> Dict[str, Any]:
         return {"kind": "bayes", "temperature": round(float(self.temperature), 4),
-                "max_emit": int(self.max_emit), "window": int(self.window)}
+                "max_emit": int(self.max_emit), "window": int(self.window),
+                "exclusive": self.exclusive}
 
 
 def load_policy(path) -> Any:
@@ -55,8 +68,47 @@ def load_policy(path) -> Any:
     if d.get("kind") == "bayes":
         return BayesPolicy(temperature=float(d["temperature"]),
                            max_emit=int(d.get("max_emit", 15)),
-                           window=int(d.get("window", 25)))
+                           window=int(d.get("window", 25)),
+                           exclusive=str(d.get("exclusive", "none")))
     return DecisionPolicy.from_dict(d)
+
+
+# ---------------------------------------------------------------------------
+# pool-side exclusivity (each S2/S3 record matches at most one S1 entity)
+# ---------------------------------------------------------------------------
+
+
+def exclusive_adjust(pool_idx: np.ndarray, prob: np.ndarray,
+                     mode: str = "hard") -> np.ndarray:
+    """Reconcile probabilities of S1 entities competing for one pool record.
+
+    Must see ALL scored pairs of the split (all S1 entities), otherwise the
+    competition is understated. Returns a new array (same dtype/order).
+    """
+    if mode not in EXCLUSIVE_MODES:
+        raise ValueError(f"unknown exclusive mode {mode!r}")
+    prob = np.asarray(prob)
+    if mode == "none" or prob.size == 0:
+        return prob
+    pool_idx = np.asarray(pool_idx)
+    if mode == "hard":
+        order = np.lexsort((-prob, pool_idx))     # best S1 first per pool record
+        ps = pool_idx[order]
+        win = order[np.r_[True, ps[1:] != ps[:-1]]]
+        out = np.zeros_like(prob)
+        out[win] = prob[win]
+        return out
+    tot = np.bincount(pool_idx, weights=prob.astype(np.float64))
+    return (prob / np.maximum(1.0, tot[pool_idx])).astype(prob.dtype)
+
+
+def decide(s1_idx, pool_idx, prob, policy, n_jobs: int = 1) -> Dict[Any, Set[Any]]:
+    """Apply the policy's exclusivity mode, then its entity-level decision."""
+    prob = exclusive_adjust(pool_idx, prob, getattr(policy, "exclusive", "none"))
+    if isinstance(policy, BayesPolicy):
+        return make_entity_predictions_bayes(s1_idx, pool_idx, prob, policy,
+                                             n_jobs=n_jobs)
+    return make_entity_predictions(s1_idx, pool_idx, prob, policy)
 
 
 # ---------------------------------------------------------------------------
@@ -228,17 +280,13 @@ def make_entity_predictions_bayes(s1_idx, pool_idx, prob, policy: BayesPolicy,
 
 def evaluate_policy(s1_idx, pool_idx, prob, truth, policy,
                     n_jobs: int = 1) -> MetricsReport:
-    if isinstance(policy, BayesPolicy):
-        preds = make_entity_predictions_bayes(s1_idx, pool_idx, prob, policy,
-                                              n_jobs=n_jobs)
-    else:
-        preds = make_entity_predictions(s1_idx, pool_idx, prob, policy)
+    preds = decide(s1_idx, pool_idx, prob, policy, n_jobs=n_jobs)
     return macro_f05(preds, truth, source_prefixes=(), include_per_entity=False)
 
 
 def tune_policy(s1_idx, pool_idx, prob, truth,
                 coarse: Optional[Sequence[float]] = None, refine: bool = True,
-                log: Optional[logging.Logger] = None
+                log: Optional[logging.Logger] = None, exclusive: str = "none"
                 ) -> Tuple[DecisionPolicy, MetricsReport, List[Dict[str, Any]]]:
     log = log or logging.getLogger(__name__)
     table: List[Dict[str, Any]] = []
@@ -247,7 +295,7 @@ def tune_policy(s1_idx, pool_idx, prob, truth,
 
     def _try(t: float) -> None:
         nonlocal best_pol, best_rep
-        pol = DecisionPolicy(threshold=float(t))
+        pol = DecisionPolicy(threshold=float(t), exclusive=exclusive)
         rep = evaluate_policy(s1_idx, pool_idx, prob, truth, pol)
         table.append({"threshold": round(float(t), 3),
                       "macro_f05": rep.macro_f05,
@@ -265,7 +313,7 @@ def tune_policy(s1_idx, pool_idx, prob, truth,
             if any(abs(t - g) < 1e-6 for g in grid):
                 continue
             _try(float(t))
-    log.info("tuned policy: threshold=%.3f macro_f05=%.4f (fp=%d fn=%d)",
-             best_pol.threshold, best_rep.macro_f05, best_rep.total_fp,
-             best_rep.total_fn)
+    log.info("tuned policy: exclusive=%s threshold=%.3f macro_f05=%.4f "
+             "(fp=%d fn=%d)", exclusive, best_pol.threshold, best_rep.macro_f05,
+             best_rep.total_fp, best_rep.total_fn)
     return best_pol, best_rep, table
