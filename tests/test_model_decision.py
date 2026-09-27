@@ -11,7 +11,8 @@ from src.aws_utils import local_artifact_path, write_json
 from src.candidate_generation import run_retrieval
 from src.entity_decision import (DecisionPolicy, evaluate_policy,
                                  make_entity_predictions, tune_policy)
-from src.model import predict_scores, save_model, train_lgbm
+from src.model import (predict_scores, save_feature_names, save_model,
+                       train_lgbm)
 from src.pair_features import FEATURE_COLUMNS
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -148,6 +149,7 @@ def test_full_pipeline_train_to_submission(synth, tmp_path):
                                "min_data_in_bin": 1, "verbose": -1})
     mdir = local_artifact_path(cfg, "models/verifier_v1")
     save_model(model, mdir / "model.txt")
+    save_feature_names(mdir, FEATURE_COLUMNS)
     write_json(mdir / "policy.json", {"threshold": 0.3, "max_emit": 15})
 
     assert predict_test.main(["--config", str(conf)]) == 0

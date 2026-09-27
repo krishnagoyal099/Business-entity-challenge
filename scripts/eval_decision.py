@@ -24,8 +24,8 @@ from src.entity_decision import BayesPolicy, evaluate_policy, load_policy
 from src.evaluator import macro_f05
 from src.ground_truth import load_ground_truth
 from src.logging_utils import setup_logging
-from src.model import load_model, predict_scores
-from src.pair_features import FEATURE_COLUMNS
+from src.model import load_feature_names, load_model, predict_scores
+from src.pair_features import LEGACY_FEATURE_COLUMNS
 
 
 def parse_args(argv=None):
@@ -45,7 +45,9 @@ def main(argv=None) -> int:
     cfg = load_config(args.config)
     log = setup_logging(cfg)
     mdir = local_artifact_path(cfg, "models/verifier_v1/policy.json").parent
-    model = load_model(args.model or (mdir / "model.txt"))
+    model_path = args.model or (mdir / "model.txt")
+    model = load_model(model_path)
+    feature_cols = load_feature_names(model_path, LEGACY_FEATURE_COLUMNS)
     fdir = (Path(args.features_dir) if args.features_dir
             else local_artifact_path(cfg, "features/train_dryrun"))
     cand_dir = (Path(args.candidates_dir) if args.candidates_dir
@@ -59,7 +61,7 @@ def main(argv=None) -> int:
         pool_l.append(t.column("pool_idx").to_numpy())
         y_l.append(t.column("label").to_numpy())
         X_l.append(np.column_stack(
-            [t.column(c).to_numpy() for c in FEATURE_COLUMNS]).astype(np.float32))
+            [t.column(c).to_numpy() for c in feature_cols]).astype(np.float32))
     s1, pool, y = np.concatenate(s1_l), np.concatenate(pool_l), np.concatenate(y_l)
     X = np.vstack(X_l)
     del s1_l, pool_l, y_l, X_l

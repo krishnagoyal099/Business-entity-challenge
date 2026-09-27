@@ -29,6 +29,14 @@ RETRIEVAL_COLUMNS = (
     "score_word_addr", "score_char_addr",
 )
 
+CONTEXT_COLUMNS = (
+    "ctx_rank_best", "ctx_rank_wa", "ctx_n_cand",
+    "ctx_top1", "ctx_margin1", "ctx_rel_best",
+)
+
+_SCORE_COLS = ("score_char_name", "score_word_name", "score_rare",
+               "score_word_addr", "score_char_addr")
+
 COMPUTED_COLUMNS = (
     "name_exact", "name_core_exact", "name_sort", "name_set", "name_jw",
     "name_len_ratio", "name_known",
@@ -37,7 +45,11 @@ COMPUTED_COLUMNS = (
     "state_match", "state_known", "country_match", "country_known",
 )
 
-FEATURE_COLUMNS = COMPUTED_COLUMNS + RETRIEVAL_COLUMNS + ("n_channels",)
+# v1 feature list (kept so the v1 model and old feature parts stay usable)
+LEGACY_FEATURE_COLUMNS = COMPUTED_COLUMNS + RETRIEVAL_COLUMNS + ("n_channels",)
+
+FEATURE_COLUMNS = COMPUTED_COLUMNS + CONTEXT_COLUMNS + RETRIEVAL_COLUMNS + (
+    "n_channels",)
 
 _POPCOUNT = np.array([bin(x).count("1") for x in range(256)], dtype=np.uint8)
 
@@ -77,6 +89,38 @@ def label_for_keys(keys: np.ndarray, gt_keys: Optional[np.ndarray]) -> np.ndarra
     pos = np.searchsorted(gt_keys, keys)
     pos_c = np.minimum(pos, gt_keys.size - 1)
     return ((pos < gt_keys.size) & (gt_keys[pos_c] == keys)).astype(np.uint8)
+
+
+def _entity_context(s1_idx: np.ndarray,
+                    retrieval: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """Within-entity context from retrieval scores (entity rows never span parts)."""
+    n = int(s1_idx.size)
+    ctx = {c: np.zeros(n, dtype=np.float32) for c in CONTEXT_COLUMNS}
+    if n == 0:
+        return ctx
+    best = np.maximum.reduce([retrieval[c].astype(np.float32) for c in _SCORE_COLS])
+    order = np.lexsort((-best, s1_idx))
+    s_sorted = s1_idx[order]
+    starts = np.r_[0, np.flatnonzero(s_sorted[1:] != s_sorted[:-1]) + 1]
+    sizes = np.diff(np.r_[starts, n])
+    rep = np.repeat(starts, sizes)              # entity start per row (sorted)
+    rank_s = (np.arange(n) - rep + 1).astype(np.float32)
+    n_cand_s = np.repeat(sizes, sizes).astype(np.float32)
+    best_s = best[order]
+    top1_s = best_s[rep]
+    margin_s = (top1_s - best_s).astype(np.float32)
+    rel_s = np.where(top1_s > 1e-9, best_s / np.maximum(top1_s, 1e-9),
+                     0.0).astype(np.float32)
+    # rank by word_addr specifically; both sorts group entities identically,
+    # so starts/sizes/rep are reusable
+    wa = retrieval["score_word_addr"].astype(np.float32)
+    order_wa = np.lexsort((-wa, s1_idx))
+    ctx["ctx_rank_wa"][order_wa] = (np.arange(n) - rep + 1).astype(np.float32)
+    for name, arr_s in (("ctx_rank_best", rank_s), ("ctx_n_cand", n_cand_s),
+                        ("ctx_top1", top1_s.astype(np.float32)),
+                        ("ctx_margin1", margin_s), ("ctx_rel_best", rel_s)):
+        ctx[name][order] = arr_s
+    return ctx
 
 
 def compute_part_features(s1_idx: np.ndarray, pool_idx: np.ndarray,
@@ -131,6 +175,7 @@ def compute_part_features(s1_idx: np.ndarray, pool_idx: np.ndarray,
             F["country_known"][i] = 1.0
             F["country_match"][i] = 1.0 if ca == cb else 0.0
     out = dict(F)
+    out.update(_entity_context(s1_idx, retrieval))
     for c in RETRIEVAL_COLUMNS:
         out[c] = retrieval[c].astype(np.float32)
     out["n_channels"] = _POPCOUNT[channel_bits].astype(np.float32)

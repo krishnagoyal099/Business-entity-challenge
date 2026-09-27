@@ -28,7 +28,8 @@ from src.entity_decision import tune_policy
 from src.evaluator import macro_f05
 from src.ground_truth import load_ground_truth
 from src.logging_utils import setup_logging, stage_timer
-from src.model import predict_scores, save_model, train_lgbm
+from src.model import (predict_scores, save_feature_names, save_model,
+                       train_lgbm)
 from src.pair_features import FEATURE_COLUMNS
 
 
@@ -41,6 +42,7 @@ def parse_args(argv=None):
                    help="default: candidates/train_dryrun (id mapping)")
     p.add_argument("--holdout-mod", type=int, default=5)
     p.add_argument("--n-estimators", type=int, default=500)
+    p.add_argument("--model-dir", default="models/verifier_v1")
     return p.parse_args(argv)
 
 
@@ -131,8 +133,9 @@ def main(argv=None) -> int:
     policy, report, table = tune_policy(s1[hold], pool[hold], prob, truth, log=log)
     timer.stop()
 
-    mdir = local_artifact_path(cfg, "models/verifier_v1")
+    mdir = local_artifact_path(cfg, args.model_dir + "/model.txt").parent
     save_model(model, mdir / "model.txt")
+    save_feature_names(mdir, FEATURE_COLUMNS)
     write_json(mdir / "policy.json", policy.to_dict())
     importance = sorted(zip(FEATURE_COLUMNS,
                             model.feature_importance(importance_type="gain").tolist()),
@@ -150,14 +153,14 @@ def main(argv=None) -> int:
         "threshold_table": table,
         "feature_importance_gain": importance[:15],
     })
-    rels = ["models/verifier_v1/model.txt", "models/verifier_v1/policy.json",
-            "models/verifier_v1/metrics.json"]
+    rels = [f"{args.model_dir}/model.txt", f"{args.model_dir}/policy.json",
+            f"{args.model_dir}/metrics.json", f"{args.model_dir}/features.json"]
     for rel in rels:
         try:
             publish_artifact(cfg, rel)
         except Exception as exc:
             log.warning("publish failed for %s (%s)", rel, exc)
-    mark_stage(cfg, "train_v1",
+    mark_stage(cfg, "train_" + args.model_dir.replace("/", "_"),
                details={"macro_f05": report.macro_f05,
                         "ceiling_macro_f05": ceil_rep.macro_f05,
                         "threshold": policy.threshold,
@@ -166,7 +169,7 @@ def main(argv=None) -> int:
                peak_rss_mb=timer.peak_rss_mb)
     try:
         from src.experiment import new_experiment, record_metrics
-        exp = new_experiment(cfg, name="verifier_v1")
+        exp = new_experiment(cfg, name=args.model_dir)
         record_metrics(cfg, exp, {"macro_f05": report.macro_f05,
                                   "ceiling_macro_f05": ceil_rep.macro_f05,
                                   "threshold": policy.threshold,
