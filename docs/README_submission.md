@@ -40,10 +40,12 @@ python scripts/train.py --config $CFG --n-estimators 1500 --model-dir models/ver
 python scripts/eval_decision.py --config $CFG --model artifacts/models/verifier_v3/model.txt
 
 # 3b. stage-2 group re-scorer (out-of-fold stage-1 probs, 3 folds)
-python scripts/stage2.py train --config $CFG --n-jobs 8
+python scripts/stage2.py train --config $CFG --n-jobs 8          # v4, trains 3 fold models
+python scripts/stage2.py train --config $CFG --model-dir models/verifier_v5 \
+    --reuse-folds models/verifier_v4 --topk 50 --n-estimators 1500 --leaves 192 --n-jobs 8
 
 # 4. test inference -> output/
-python scripts/stage2.py predict --config $CFG --n-jobs 8
+python scripts/stage2.py predict --config $CFG --model-dir models/verifier_v5 --topk 50 --n-jobs 8
 python scripts/validate_submission.py --config $CFG
 ```
 

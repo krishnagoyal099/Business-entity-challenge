@@ -61,6 +61,9 @@ def parse_args(argv=None):
                    help="train: model dir whose stage1_fold*.txt to reuse")
     p.add_argument("--leaves", type=int, default=None,
                    help="train: stage-2 num_leaves override")
+    p.add_argument("--full-fit", action="store_true",
+                   help="train: after tuning on the holdout, refit stage 2 on ALL "
+                        "rows (holdout included) with the same settings")
     return p.parse_args(argv)
 
 
@@ -186,6 +189,11 @@ def train(args, cfg, log) -> int:
                 best_pol, best_rep = bp, rep
 
     names = cols + list(GROUP_COLUMNS)
+    if args.full_fit:
+        t0 = time.time()
+        model = train_lgbm(X2, y.astype(np.int32), n_estimators=args.n_estimators,
+                           params={"num_leaves": args.leaves} if args.leaves else None)
+        log.info("full-fit stage 2 (all %d rows) in %.0fs", y.size, time.time() - t0)
     save_model(model, mdir / "model.txt")
     save_feature_names(mdir, names)
     write_json(mdir / "policy.json", best_pol.to_dict())

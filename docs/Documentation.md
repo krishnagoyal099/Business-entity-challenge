@@ -14,7 +14,7 @@ hand-built similarity features (including rule-based transliteration of nine
 Indic scripts), a second LightGBM stage that re-scores each candidate using the
 entity's confidently matched records, and a decision layer that enforces the
 data's one-to-one structure (every S2/S3 record belongs to at most one S1
-entity). Holdout macro F0.5: **[FINAL]** (public leaderboard **[FINAL]**).
+entity). Holdout macro F0.5: **0.9576** (public leaderboard **[LB]**).
 
 ---
 
@@ -68,7 +68,7 @@ all 245M test pairs; (2) stage-2 group features that link hard positives
   (~142 per entity); 43.3M for the 300k-entity training sample.
 - **Recall:** 96.7% of true pairs in the training sample are retrieved; a
   perfect verifier on these candidates would score macro F0.5 = 0.9886.
-- `candidate_pairs.tsv` lists the top-[K] stage-2 candidates per entity — the
+- `candidate_pairs.tsv` lists the top-50 stage-2 candidates per entity — the
   exact set the final model scores.
 
 ---
@@ -88,7 +88,7 @@ all 245M test pairs; (2) stage-2 group features that link hard positives
 - *Within-entity context:* rank by best retrieval score and by address score,
   candidate count, top-1 score, margin and relative score.
 
-**Stage 2 (group features, top-[K] per entity):** out-of-fold stage-1
+**Stage 2 (group features, top-50 per entity):** out-of-fold stage-1
 probability, rank in group, number of anchors (other candidates with
 p ≥ 0.5), max / sum of other probabilities, exact-address equality with an
 anchor, max address similarity to an anchor, address-number equality with an
@@ -96,7 +96,7 @@ anchor, max name-skeleton similarity to an anchor, share of anchors agreeing on
 one address.
 
 **Model type:** LightGBM binary classifiers (stage 1: 1500 trees, 96 leaves;
-3 out-of-fold stage-1 models for stage 2; stage 2: 800 trees).
+3 out-of-fold stage-1 models (600 trees each) for stage 2; stage 2: 1500 trees, 192 leaves).
 **Threshold selection method:** macro F0.5 on a holdout of 20% of S1 entities
 (index % 5 == 0), searching threshold and Bayes expected-F0.5 policies (the
 latter computes the F0.5-optimal prefix per entity from the pair probabilities
@@ -111,8 +111,9 @@ At test time "hard" exclusivity keeps each S2/S3 record only on its best S1.
 |---|---|---|
 | v1 verifier, threshold 0.7 | 0.9325 | 0.907 |
 | + pool-side exclusivity | 0.9329 (holdout understates it) | 0.923 |
-| v3: state fix + transliteration + address-number features | 0.9537 | [FILL] |
-| v4: stage-2 group re-scorer | [FILL] | [FILL] |
+| v3: state fix + transliteration + address-number features | 0.9537 | [LB3] |
+| v4: stage-2 group re-scorer (top-30, 800 trees) | 0.9567 | — |
+| **v5: stage 2 top-50, 1500 trees, 192 leaves (final)** | **0.9576** | **[LB]** |
 
 Holdout exclusivity gains are a lower bound: only holdout entities compete
 there, while on test every entity competes (it removed ~265k double claims).
@@ -147,5 +148,8 @@ points: `scripts/generate_candidates.py`, `scripts/build_features.py`,
 
 ### B. Additional Results
 
-Per-country emitted ids per entity (label-free check, final submission):
-[FILL from `scripts/diag_by_country.py`].
+Per-country emitted ids per entity (label-free check), before → after the
+France state fix and exclusivity: India 3.00 → 2.94 → 3.10, US 3.20 → 3.18 →
+3.22, France 3.91 → 3.15 → 3.16 (train truth ≈ 3.46). Double-claimed pool ids
+in the final submission: 0.0%. Only 24 of 1,003,899 retrieved true pairs
+(0.002%) fall outside the stage-2 top-30.
