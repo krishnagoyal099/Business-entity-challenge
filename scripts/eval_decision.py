@@ -61,9 +61,14 @@ def main(argv=None) -> int:
     cand_dir = (Path(args.candidates_dir) if args.candidates_dir
                 else candidates_dir(cfg, "train", dry_run=True))
 
+    parts = sorted(fdir.glob("part_*.parquet"))
+    if not parts:
+        log.error("no feature parts at %s (default is features/train_dryrun; "
+                  "pass --features-dir)", fdir.resolve())
+        return 2
     t0 = time.time()
     s1_l, pool_l, y_l, X_l = [], [], [], []
-    for part in sorted(fdir.glob("part_*.parquet")):
+    for part in parts:
         t = pq.read_table(part)
         s1_l.append(t.column("s1_idx").to_numpy())
         pool_l.append(t.column("pool_idx").to_numpy())

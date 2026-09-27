@@ -51,6 +51,22 @@ LEGACY_FEATURE_COLUMNS = COMPUTED_COLUMNS + RETRIEVAL_COLUMNS + ("n_channels",)
 FEATURE_COLUMNS = COMPUTED_COLUMNS + CONTEXT_COLUMNS + RETRIEVAL_COLUMNS + (
     "n_channels",)
 
+# 2-letter state codes that are also common words in other languages
+# ("rue de la ..." -> DE, LA; "in", "or", "me" ...). Mid-address they are read
+# as words; only an address-initial/final code or one before a zip counts.
+_AMBIGUOUS_STATE_TOKENS = frozenset({"de", "la", "in", "or", "me", "co", "al",
+                                     "ma", "pa", "hi", "id", "ok", "oh", "ne"})
+
+
+def address_states(toks: List[str]) -> frozenset:
+    """US/India states of an address, ignoring ambiguous mid-address words."""
+    n = len(toks)
+    keep = [t for i, t in enumerate(toks)
+            if t not in _AMBIGUOUS_STATE_TOKENS or i == 0 or i == n - 1
+            or (i + 1 < n and toks[i + 1].isdigit() and len(toks[i + 1]) == 5)]
+    return frozenset(_extract_states(keep))
+
+
 _POPCOUNT = np.array([bin(x).count("1") for x in range(256)], dtype=np.uint8)
 
 
@@ -75,7 +91,7 @@ def build_side_table(paths, limit_rows: Optional[int] = None) -> Dict[str, list]
         ht = next((t for t in toks if any(c.isdigit() for c in t)), "")
         house.append("".join(c for c in ht if c.isdigit()))
         digits.append("".join(c for c in a if c.isdigit()))
-        states.append(frozenset(_extract_states(toks)))
+        states.append(address_states(toks))
     return {"name_core": name_core, "name_sorted": name_sorted,
             "name_alnum": name_alnum, "addr_core": addr_core,
             "country": country, "house": house, "digits": digits,

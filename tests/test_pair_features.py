@@ -114,3 +114,18 @@ def test_build_features_script_end_to_end(synth, tmp_path):
     total_pos = sum(int(pq.read_table(p, columns=["label"]).column(0)
                         .to_numpy().sum()) for p in parts)
     assert total_pos >= 4          # 5 mappable true pairs, recall >= 0.8
+
+
+def test_address_states_ignore_french_function_words():
+    from src.normalization import build_address_views
+    from src.pair_features import address_states
+
+    def st(a):
+        return address_states(list(build_address_views(a).core))
+    assert st("106 Rue de la Gaudiniere, Nantes, Pays de la Loire") == frozenset()
+    assert st("N 212 RUE DE LA BENAUGE, BORDEAUX") == frozenset()
+    assert st("12 Elm St, Dover, DE") == {"DE"}
+    assert st("OH, Columbus, 5559 Orville Avenue") == {"OH"}
+    assert st("5415 ARMOUR DRIVE, TN, SOMERVILLE") == {"TN"}
+    assert st("1 Main St, La Crosse, WI") == {"WI"}
+    assert st("Columbus OH 43215 Main") == {"OH"}
