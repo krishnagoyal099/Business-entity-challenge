@@ -57,6 +57,10 @@ def parse_args(argv=None):
     p.add_argument("--exclusive", default=None, choices=EXCLUSIVE_MODES,
                    help="predict: override the tuned exclusivity mode")
     p.add_argument("--n-jobs", type=int, default=8)
+    p.add_argument("--reuse-folds", default=None,
+                   help="train: model dir whose stage1_fold*.txt to reuse")
+    p.add_argument("--leaves", type=int, default=None,
+                   help="train: stage-2 num_leaves override")
     return p.parse_args(argv)
 
 
@@ -107,11 +111,16 @@ def train(args, cfg, log) -> int:
     # ---- stage 1: out-of-fold probabilities ----------------------------
     oof = np.zeros(s1.size, dtype=np.float32)
     fold = s1 % args.folds
+    rdir = (local_artifact_path(cfg, args.reuse_folds + "/model.txt").parent
+            if args.reuse_folds else None)
     for f in range(args.folds):
         t0 = time.time()
         tr = fold != f
-        m = train_lgbm(X[tr], y[tr].astype(np.int32), n_estimators=args.fold_trees,
-                       params=FOLD_PARAMS)
+        if rdir is not None:
+            m = load_model(rdir / f"stage1_fold{f}.txt")
+        else:
+            m = train_lgbm(X[tr], y[tr].astype(np.int32),
+                           n_estimators=args.fold_trees, params=FOLD_PARAMS)
         oof[~tr] = predict_scores(m, X[~tr])
         save_model(m, mdir / f"stage1_fold{f}.txt")
         log.info("fold %d/%d trained+scored in %.0fs", f + 1, args.folds,
@@ -151,7 +160,8 @@ def train(args, cfg, log) -> int:
     hold = (s1 % args.holdout_mod) == 0
     t0 = time.time()
     model = train_lgbm(X2[~hold], y[~hold].astype(np.int32),
-                       n_estimators=args.n_estimators)
+                       n_estimators=args.n_estimators,
+                       params={"num_leaves": args.leaves} if args.leaves else None)
     prob = predict_scores(model, X2[hold])
     log.info("stage 2 trained in %.0fs", time.time() - t0)
     s_h, p_h = s1[hold], pool[hold]
