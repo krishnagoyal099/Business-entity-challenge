@@ -34,7 +34,11 @@ def main(argv=None) -> int:
             country[row["entity_id"]] = row.get("country") or "?"
     match = _read_lists(a.matching, "matched_entity_ids")
     cand = _read_lists(a.candidate, "candidate_entity_ids")
-    agg = defaultdict(lambda: [0, 0, 0, 0])   # n, with_match, emitted, cands
+    claims = defaultdict(int)                 # pool id -> #S1 entities claiming it
+    for ids in match.values():
+        for x in ids:
+            claims[x] += 1
+    agg = defaultdict(lambda: [0, 0, 0, 0, 0])  # n, matched, emitted, cands, multi
     for sid, c in country.items():
         m = match.get(sid, [])
         g = agg[c]
@@ -42,10 +46,14 @@ def main(argv=None) -> int:
         g[1] += bool(m)
         g[2] += len(m)
         g[3] += len(cand.get(sid, []))
+        g[4] += sum(claims[x] > 1 for x in m)
     print(f"{'country':<10}{'entities':>10}{'%matched':>10}{'emit/ent':>10}"
-          f"{'cand/ent':>10}")
-    for c, (n, w, e, k) in sorted(agg.items(), key=lambda kv: -kv[1][0]):
-        print(f"{c:<10}{n:>10}{100 * w / n:>9.1f}%{e / n:>10.2f}{k / n:>10.1f}")
+          f"{'cand/ent':>10}{'%multi':>9}")
+    for c, (n, w, e, k, mu) in sorted(agg.items(), key=lambda kv: -kv[1][0]):
+        print(f"{c:<10}{n:>10}{100 * w / n:>9.1f}%{e / n:>10.2f}{k / n:>10.1f}"
+              f"{100 * mu / max(1, e):>8.1f}%")
+    print("%multi = emitted ids also claimed by another S1 entity (always an "
+          "error: each S2/S3 record matches at most one S1)")
     print("train reference: ~94.4% matched, ~3.46 true matches/entity")
     return 0
 

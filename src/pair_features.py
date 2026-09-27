@@ -19,6 +19,7 @@ from rapidfuzz.distance import JaroWinkler
 
 from .blocking import iter_column
 from .normalization import _extract_states
+from .transliterate import has_non_latin_letters, skeleton
 
 log = logging.getLogger(__name__)
 
@@ -45,11 +46,19 @@ COMPUTED_COLUMNS = (
     "state_match", "state_known", "country_match", "country_known",
 )
 
+# v3: cross-script / glued-name / address-number features
+EXTRA_COLUMNS = (
+    "name_skel_set", "name_skel_ratio", "name_script_mix",
+    "name_glued_ratio", "name_glued_partial",
+    "addr_num_known", "addr_num_jacc", "addr_num_subset", "addr_num_equal",
+    "addr_alpha_jacc", "addr_skel_set",
+)
+
 # v1 feature list (kept so the v1 model and old feature parts stay usable)
 LEGACY_FEATURE_COLUMNS = COMPUTED_COLUMNS + RETRIEVAL_COLUMNS + ("n_channels",)
 
-FEATURE_COLUMNS = COMPUTED_COLUMNS + CONTEXT_COLUMNS + RETRIEVAL_COLUMNS + (
-    "n_channels",)
+FEATURE_COLUMNS = (COMPUTED_COLUMNS + EXTRA_COLUMNS + CONTEXT_COLUMNS
+                   + RETRIEVAL_COLUMNS + ("n_channels",))
 
 # 2-letter state codes that are also common words in other languages
 # ("rue de la ..." -> DE, LA; "in", "or", "me" ...). Mid-address they are read
@@ -86,16 +95,28 @@ def build_side_table(paths, limit_rows: Optional[int] = None) -> Dict[str, list]
     house: List[str] = []
     digits: List[str] = []
     states: List[frozenset] = []
+    nums: List[frozenset] = []
+    alphas: List[frozenset] = []
+    addr_skel: List[str] = []
     for a in addr_core:
         toks = a.split()
         ht = next((t for t in toks if any(c.isdigit() for c in t)), "")
         house.append("".join(c for c in ht if c.isdigit()))
         digits.append("".join(c for c in a if c.isdigit()))
         states.append(address_states(toks))
+        # numbers compared as values: "053" == "53" (zero-padding noise)
+        nums.append(frozenset(t.lstrip("0") or "0" for t in toks if t.isdigit()))
+        alphas.append(frozenset(t for t in toks if t.isalpha() and len(t) > 1))
+        addr_skel.append(skeleton(a))
+    name_skel = [skeleton(x) for x in name_alnum]
+    script = [has_non_latin_letters(x) for x in name_alnum]
+    glued = [x.replace(" ", "") for x in name_core]
     return {"name_core": name_core, "name_sorted": name_sorted,
             "name_alnum": name_alnum, "addr_core": addr_core,
             "country": country, "house": house, "digits": digits,
-            "states": states}
+            "states": states, "nums": nums, "alphas": alphas,
+            "addr_skel": addr_skel, "name_skel": name_skel,
+            "script": script, "glued": glued}
 
 
 def label_for_keys(keys: np.ndarray, gt_keys: Optional[np.ndarray]) -> np.ndarray:
@@ -146,7 +167,7 @@ def compute_part_features(s1_idx: np.ndarray, pool_idx: np.ndarray,
                           pool_side: Dict[str, list]) -> Dict[str, np.ndarray]:
     """Compute all FEATURE_COLUMNS for one block of candidate pairs."""
     n = int(s1_idx.size)
-    F = {c: np.zeros(n, dtype=np.float32) for c in COMPUTED_COLUMNS}
+    F = {c: np.zeros(n, dtype=np.float32) for c in COMPUTED_COLUMNS + EXTRA_COLUMNS}
     s_na, p_na = s1_side["name_alnum"], pool_side["name_alnum"]
     s_nc, p_nc = s1_side["name_core"], pool_side["name_core"]
     s_ns, p_ns = s1_side["name_sorted"], pool_side["name_sorted"]
@@ -155,6 +176,12 @@ def compute_part_features(s1_idx: np.ndarray, pool_idx: np.ndarray,
     s_ho, p_ho = s1_side["house"], pool_side["house"]
     s_di, p_di = s1_side["digits"], pool_side["digits"]
     s_st, p_st = s1_side["states"], pool_side["states"]
+    s_nk, p_nk = s1_side["name_skel"], pool_side["name_skel"]
+    s_sc, p_sc = s1_side["script"], pool_side["script"]
+    s_gl, p_gl = s1_side["glued"], pool_side["glued"]
+    s_nu, p_nu = s1_side["nums"], pool_side["nums"]
+    s_al, p_al = s1_side["alphas"], pool_side["alphas"]
+    s_ak, p_ak = s1_side["addr_skel"], pool_side["addr_skel"]
     for i in range(n):
         a = int(s1_idx[i])
         b = int(pool_idx[i])
@@ -167,6 +194,15 @@ def compute_part_features(s1_idx: np.ndarray, pool_idx: np.ndarray,
             F["name_set"][i] = fuzz.token_set_ratio(s_nc[a], p_nc[b])
             F["name_jw"][i] = 100.0 * JaroWinkler.similarity(fa, fb)
             F["name_len_ratio"][i] = len(fa) / len(fb)
+            F["name_script_mix"][i] = float(s_sc[a] != p_sc[b])
+        ka, kb = s_nk[a], p_nk[b]
+        if ka and kb:
+            F["name_skel_set"][i] = fuzz.token_set_ratio(ka, kb)
+            F["name_skel_ratio"][i] = fuzz.ratio(ka, kb)
+        ga, gb = s_gl[a], p_gl[b]
+        if ga and gb:
+            F["name_glued_ratio"][i] = fuzz.ratio(ga, gb)
+            F["name_glued_partial"][i] = fuzz.partial_ratio(ga, gb)
         aa, ab = s_ac[a], p_ac[b]
         if aa and ab:
             F["addr_known"][i] = 1.0
@@ -174,6 +210,17 @@ def compute_part_features(s1_idx: np.ndarray, pool_idx: np.ndarray,
             F["addr_sort"][i] = fuzz.token_sort_ratio(aa, ab)
             F["addr_set"][i] = fuzz.token_set_ratio(aa, ab)
             F["addr_len_ratio"][i] = len(aa) / len(ab)
+            F["addr_skel_set"][i] = fuzz.token_set_ratio(s_ak[a], p_ak[b])
+        na, nb = s_nu[a], p_nu[b]
+        if na and nb:
+            inter = len(na & nb)
+            F["addr_num_known"][i] = 1.0
+            F["addr_num_jacc"][i] = inter / len(na | nb)
+            F["addr_num_subset"][i] = float(inter == min(len(na), len(nb)))
+            F["addr_num_equal"][i] = float(na == nb)
+        la, lb = s_al[a], p_al[b]
+        if la and lb:
+            F["addr_alpha_jacc"][i] = len(la & lb) / len(la | lb)
         ha, hb = s_ho[a], p_ho[b]
         if ha and hb:
             F["house_known"][i] = 1.0

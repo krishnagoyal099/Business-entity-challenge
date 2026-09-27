@@ -50,7 +50,7 @@ def main(argv=None) -> int:
     model = load_model(model_path)
     feature_cols = load_feature_names(model_path, LEGACY_FEATURE_COLUMNS)
     log.info("model uses %d features", len(feature_cols))
-    pol_path = args.policy or local_artifact_path(cfg, "models/verifier_v1/policy.json")
+    pol_path = args.policy or (Path(model_path).parent / "policy.json")
     policy = load_policy(pol_path)
     if args.threshold is not None and isinstance(policy, DecisionPolicy):
         policy.threshold = float(args.threshold)

@@ -52,8 +52,9 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     cfg = load_config(args.config)
     log = setup_logging(cfg)
-    mdir = local_artifact_path(cfg, "models/verifier_v1/policy.json").parent
-    model_path = args.model or (mdir / "model.txt")
+    model_path = Path(args.model or local_artifact_path(
+        cfg, "models/verifier_v1/model.txt"))
+    mdir = model_path.parent             # policy.json lives next to the model
     model = load_model(model_path)
     feature_cols = load_feature_names(model_path, LEGACY_FEATURE_COLUMNS)
     fdir = (Path(args.features_dir) if args.features_dir
